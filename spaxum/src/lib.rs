@@ -1,0 +1,399 @@
+use axum::{
+    extract::{Request, State},
+    response::{Html, Response},
+    routing::get,
+    Router,
+};
+use hyper::{StatusCode, Uri};
+use hyper_util::{client::legacy::connect::HttpConnector, rt::TokioExecutor};
+use memory_serve::{Asset, MemoryServe};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    env,
+    path::{Path, PathBuf},
+    process::{exit, Command},
+};
+
+pub use memory_serve;
+
+/// HTTP client to proxy request in development
+type Client = hyper_util::client::legacy::Client<
+    hyper_util::client::legacy::connect::HttpConnector,
+    axum::body::Body,
+>;
+
+/// File names for the entrypoint files (js, css)
+#[derive(Debug, Deserialize, Serialize)]
+pub struct EntryFiles {
+    pub js: String,
+    pub css: String,
+}
+
+/// Engine for serving assets, either proxy to an eslint instance or serve from memory
+enum SpaxumEngine {
+    Proxy,
+    MemoryServe(EntryFiles, MemoryServe),
+}
+
+/// Spaxum instance, holds the page title and the statis asset engine
+pub struct Spaxum {
+    title: String,
+    engine: SpaxumEngine,
+}
+
+/// Load the assets from the memory or proxy to an esbuild instance
+/// Returns a Spaxum instance that can be used to create an axum router
+#[macro_export]
+macro_rules! load {
+    ($title:expr) => {{
+        use spaxum::memory_serve::{self, Asset};
+        use std::path::Path;
+
+        if let Some(entrypoint) = option_env!("SPAXUM_ENTRYPOINT") {
+            let dist_dir = Path::new(concat!(env!("OUT_DIR"), "/dist"));
+
+            spaxum::Spaxum::new_proxy($title, entrypoint, dist_dir)
+        } else {
+            let assets: &[Asset] = include!(concat!(env!("OUT_DIR"), "/spaxum.rs"));
+
+            let entry_files = spaxum::EntryFiles {
+                js: option_env!("SPAXUM_JS_ENTRY")
+                    .unwrap_or_default()
+                    .to_string(),
+                css: option_env!("SPAXUM_CSS_ENTRY")
+                    .unwrap_or_default()
+                    .to_string(),
+            };
+
+            spaxum::Spaxum::new($title, assets, entry_files)
+        }
+    }};
+}
+
+impl Spaxum {
+    /// Create a new Spaxum instance, with the page title, assets and entry files
+    /// Serves the assets from memory
+    pub fn new(title: &str, assets: &'static [Asset], entry_files: EntryFiles) -> Self {
+        let memory_serve = MemoryServe::new(assets);
+
+        Self {
+            title: title.to_string(),
+            engine: SpaxumEngine::MemoryServe(entry_files, memory_serve),
+        }
+    }
+
+    /// Create a new Spaxum instance, with the page title, entrypoint and dist directory
+    /// Uses esbuild to bundle the assets and serve them in development mode
+    pub fn new_proxy(title: &str, entrypoint: &str, dist_dir: &Path) -> Self {
+        let esbuild = get_esbuild_path();
+
+        // cleanup and ignore if directory is already empty
+        let _ = std::fs::remove_dir_all(dist_dir);
+
+        let Some(dist_dir) = dist_dir.to_str() else {
+            panic!("Invalid path provided by OUT_DIR");
+        };
+
+        let outdir = format!("--outdir={dist_dir}");
+        let servedir = format!("--servedir={dist_dir}");
+
+        let Ok(mut child) = Command::new(esbuild)
+            .args([
+                entrypoint,
+                "--bundle",
+                &outdir,
+                "--watch",
+                &servedir,
+                "--serve=127.0.0.1:8888",
+                "--entry-names=index",
+                "--loader:.png=file",
+                "--color=false",
+            ])
+            .spawn()
+        else {
+            panic!("esbuild failed to start");
+        };
+
+        tokio::task::spawn_blocking(move || {
+            child.wait().expect("esbuild failed to start");
+        });
+
+        Self {
+            title: title.to_string(),
+            engine: SpaxumEngine::Proxy,
+        }
+    }
+
+    /// Get the memory serve instance, this can de uysed tio fine-tune memory serve settings
+    pub fn memory_serve(&self) -> Option<&MemoryServe> {
+        match &self.engine {
+            SpaxumEngine::MemoryServe(_, memory_serve) => Some(memory_serve),
+            _ => None,
+        }
+    }
+
+    /// Get the axum router for the Spaxum instance, serves statis assets (from the "/static" path)
+    pub fn router(self) -> Router {
+        match self.engine {
+            SpaxumEngine::MemoryServe(entry_files, memory_serve) => {
+                let html = include_str!("../index.html")
+                    .replace("%TITLE%", &self.title)
+                    .replace("%SCRIPT%", &entry_files.js)
+                    .replace("%STYLESHEET%", &entry_files.css);
+
+                Router::new()
+                    .nest("/static", memory_serve.into_router())
+                    .fallback(Html(html))
+            }
+            _ => {
+                let html =
+                    include_str!("../index_live_reload.html").replace("%TITLE%", &self.title);
+
+                let client: Client =
+                    hyper_util::client::legacy::Client::<(), ()>::builder(TokioExecutor::new())
+                        .build(HttpConnector::new());
+
+                let proxy_router = Router::new()
+                    .fallback(get(proxy_handler))
+                    .with_state(client);
+
+                Router::new()
+                    .nest("/static", proxy_router)
+                    .fallback(Html(html))
+            }
+        }
+    }
+}
+
+/// Proxy handler for development mode, proxies requests to the esbuild dev server
+async fn proxy_handler(
+    State(client): State<Client>,
+    mut req: Request,
+) -> Result<Response, StatusCode> {
+    use axum::response::IntoResponse;
+
+    let path = req.uri().path();
+    let path_query = req
+        .uri()
+        .path_and_query()
+        .map(|v| v.as_str())
+        .unwrap_or(path);
+
+    let uri = format!("http://127.0.0.1:8888{}", path_query);
+
+    let Ok(uri) = Uri::try_from(uri) else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+
+    *req.uri_mut() = uri;
+
+    Ok(client
+        .request(req)
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?
+        .into_response())
+}
+
+/// Esbuild manifest output structure
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Output {
+    bytes: usize,
+    css_bundle: Option<String>,
+    entry_point: Option<String>,
+}
+
+/// Esbuild manifest structure
+#[derive(Debug, Deserialize, Serialize)]
+struct Manifest {
+    outputs: HashMap<String, Output>,
+}
+
+impl EntryFiles {
+    /// Get the entry files from the esbuild manifest file
+    fn from_manifest(manifest_file: &str, entrypoint: &Path) -> Option<Self> {
+        let manifest_str =
+            std::fs::read_to_string(manifest_file).expect("Unable to read manifest file.");
+
+        let manifest: Manifest =
+            serde_json::from_str(&manifest_str).expect("Unmable to parse manifest file.");
+
+        for (name, output) in manifest.outputs.iter() {
+            if let Some(js) = output.entry_point.as_ref() {
+                if entrypoint.to_string_lossy().ends_with(js) {
+                    return Some(EntryFiles {
+                        js: Path::new(name)
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string(),
+                        css: output
+                            .css_bundle
+                            .as_ref()
+                            .and_then(|f| {
+                                Some(Path::new(&f).file_name()?.to_string_lossy().to_string())
+                            })
+                            .unwrap_or_default(),
+                    });
+                }
+            }
+        }
+
+        None
+    }
+}
+
+/// Error macro for build scripts
+macro_rules! error {
+    ($s:expr) => {
+        println!("cargo::error={}", $s);
+        exit(1);
+    };
+
+    ($s:expr, $($v:tt)*) => {
+        println!("cargo::error={}", format!($s, $($v)*));
+        exit(1);
+    };
+}
+
+/// Get the path to the esbuild executable
+/// Optionally use esbuild binary shipped with spaxum, fallback the system esbuild
+fn get_esbuild_path() -> PathBuf {
+    if !cfg!(target_arch = "x86_64") {
+        return PathBuf::from("esbuild");
+    }
+
+    let current_dir = Path::new(file!()).parent().and_then(|p| p.parent());
+
+    match current_dir {
+        Some(p) => {
+            let esbuild = p.join("esbuild");
+
+            if esbuild.exists() {
+                esbuild
+            } else {
+                PathBuf::from("esbuild")
+            }
+        }
+        None => PathBuf::from("esbuild"),
+    }
+}
+
+/// File name to write asset metadata to
+const ASSET_FILE: &str = "spaxum.rs";
+
+/// Write the asset metadata to a file
+fn write_asset_file(out_dir: &Path, code: &str) {
+    let target = out_dir.join(ASSET_FILE);
+    match std::fs::write(&target, code) {
+        Ok(_) => {}
+        Err(e) => {
+            error!(
+                "Unable to write asset file: {} {e:?}",
+                target.to_string_lossy()
+            );
+        }
+    }
+}
+
+/// Bundle the assets using release compilation with esbuild
+/// Pass the entrypoint to the runtime for debug builds
+pub fn bundle(entrypoint: &str) {
+    // Log messages to cargo
+    fn log(msg: &str) {
+        if std::env::var("SPAXUM_QUIET") != Ok("1".to_string()) {
+            println!("cargo::warning={}", msg);
+        }
+    }
+
+    // Check if the entrypoint exists
+    let Ok(entrypoint) = Path::new(&entrypoint).canonicalize() else {
+        error!("{} not found!", entrypoint);
+    };
+
+    // Get the OUT_DIR environment variable, this is where we store compressed assets and asset metadata code
+    let Some(out_dir) = env::var_os("OUT_DIR") else {
+        error!("OUT_DIR not set!");
+    };
+
+    // Create neccesary paths and their string variants
+    let out_dir = Path::new(&out_dir);
+    let dist_dir = out_dir.join("dist");
+    let dist_dir_str = dist_dir.to_string_lossy();
+    let entrypoint_str = entrypoint.to_string_lossy();
+    let manifest_file = out_dir.join("manifest.json");
+    let manifest_file_str = manifest_file.to_string_lossy();
+
+    // Skip bundling in debug mode, assets will be served by the esbuild dev server
+    if cfg!(debug_assertions) {
+        println!("cargo::rustc-env=SPAXUM_ENTRYPOINT={entrypoint_str}");
+        write_asset_file(out_dir, "&[]");
+        log("Skipping bundling in debug mode, assets will be served by the esbuild dev server.");
+        exit(0);
+    }
+
+    // Cleanup and ignore if directory is already empty
+    let _ = std::fs::remove_dir_all(&dist_dir);
+
+    // Determine the directory of the entrypoint file, and rerun the build if it changes
+    let Some(source_dir) = entrypoint.parent() else {
+        error!(
+            "Unable to get parent directory of entrypoint: {}",
+            entrypoint_str
+        );
+    };
+
+    // Rerun build script if source directory changes
+    println!("cargo::rerun-if-changed={}", source_dir.to_string_lossy());
+
+    // Bundle assets using esbuild
+    let esbuild = get_esbuild_path();
+    let Ok(result) = Command::new(esbuild)
+        .args([
+            "--bundle",
+            &entrypoint_str,
+            &format!("--outfile={dist_dir_str}/index.js"),
+            &format!("--metafile={manifest_file_str}"),
+            "--entry-names=[name]-[hash]",
+            "--loader:.png=file",
+            "--public-path=/static/",
+            "--minify",
+            "--color=false",
+        ])
+        .output()
+    else {
+        error!("esbuild failed to start");
+    };
+
+    // Log errors if esbuild fails
+    if !result.status.success() {
+        let errors = String::from_utf8_lossy(&result.stderr);
+        while let Some(line) = errors.lines().next() {
+            log(&format!("esbuild error: {line}"));
+        }
+
+        error!("esbuild failed to bundle: {entrypoint_str}");
+    }
+
+    // Log success message
+    log("esbuild completed successfully");
+
+    // read contents of manifest_file as string
+    let Some(entry_point) = EntryFiles::from_manifest(&manifest_file_str, &entrypoint) else {
+        error!(
+            "Unable to find entrypoint in manifest file: {}",
+            manifest_file_str
+        );
+    };
+
+    // Set environment variables for the entrypoint files
+    println!("cargo::rustc-env=SPAXUM_JS_ENTRY={}", entry_point.js);
+    println!("cargo::rustc-env=SPAXUM_CSS_ENTRY={}", entry_point.css);
+
+    // Convert assets to code and write to file
+    let code =
+        memory_serve_core::assets_to_code(&dist_dir_str, &dist_dir, Some(out_dir), true, log);
+
+    write_asset_file(out_dir, &code);
+}
