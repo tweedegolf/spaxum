@@ -134,7 +134,9 @@ impl Spaxum {
     }
 
     /// Get the axum router for the Spaxum instance, serves statis assets (from the "/static" path)
-    pub fn router(self) -> Router {
+    pub fn router<S>(self) -> Router<S>
+    where S: Clone + Send + Sync + 'static
+    {
         match self.engine {
             SpaxumEngine::MemoryServe(entry_files, memory_serve) => {
                 let html = include_str!("../index.html")
