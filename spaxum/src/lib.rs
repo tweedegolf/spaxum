@@ -9,10 +9,7 @@ use hyper_util::{client::legacy::connect::HttpConnector, rt::TokioExecutor};
 use memory_serve::{Asset, MemoryServe};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
-    env,
-    path::{Path, PathBuf},
-    process::{exit, Command},
+    collections::HashMap, env, io::{BufRead, BufReader}, path::{Path, PathBuf}, process::{exit, Command, Stdio}
 };
 
 pub use memory_serve;
@@ -352,7 +349,7 @@ pub fn bundle(entrypoint: &str) {
 
     // Bundle assets using esbuild
     let esbuild = get_esbuild_path();
-    let Ok(result) = Command::new(esbuild)
+    let Ok(mut child) = Command::new(esbuild)
         .args([
             "--bundle",
             &entrypoint_str,
@@ -368,18 +365,33 @@ pub fn bundle(entrypoint: &str) {
             "--minify",
             "--color=false",
         ])
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
     else {
         error!("esbuild failed to start");
     };
 
-    // Log errors if esbuild fails
-    if !result.status.success() {
-        let errors = String::from_utf8_lossy(&result.stderr);
-        while let Some(line) = errors.lines().next() {
+    if let Some(ref mut stdout) = child.stdout {
+        for line in BufReader::new(stdout).lines() {
+            let line = line.unwrap();
             log(&format!("esbuild error: {line}"));
         }
+    }
 
+    if let Some(ref mut stderr) = child.stderr {
+        for line in BufReader::new(stderr).lines() {
+            let line = line.unwrap();
+            log(&format!("esbuild: {line}"));
+        }
+    }
+
+    let Ok(status) = child.wait() else {
+        error!("esbuild failed to bundle: {entrypoint_str}");
+    };
+
+    // Log errors if esbuild fails
+    if !status.success() {
         error!("esbuild failed to bundle: {entrypoint_str}");
     }
 
