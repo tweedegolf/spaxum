@@ -344,7 +344,7 @@ pub fn bundle(entrypoint: &str) {
             entrypoint_str
         );
     };
-x
+
     // Rerun build script if source directory changes
     println!("cargo::rerun-if-changed={}", source_dir.to_string_lossy());
 
