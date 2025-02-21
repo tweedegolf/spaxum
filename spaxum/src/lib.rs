@@ -107,7 +107,6 @@ impl Spaxum {
                 &servedir,
                 "--serve=127.0.0.1:8888",
                 "--entry-names=index",
-                "--loader:.png=file",
                 "--color=false",
             ])
             .spawn()
@@ -345,7 +344,7 @@ pub fn bundle(entrypoint: &str) {
             entrypoint_str
         );
     };
-
+x
     // Rerun build script if source directory changes
     println!("cargo::rerun-if-changed={}", source_dir.to_string_lossy());
 
@@ -361,6 +360,10 @@ pub fn bundle(entrypoint: &str) {
             &format!("--metafile={manifest_file_str}"),
             "--entry-names=[name]-[hash]",
             "--loader:.png=file",
+            "--loader:.jpg=file",
+            "--loader:.jpeg=file",
+            "--loader:.svg=file",
+            "--loader:.gif=file",
             "--public-path=/static/",
             "--minify",
             "--color=false",
