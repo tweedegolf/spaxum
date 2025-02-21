@@ -349,6 +349,8 @@ pub fn bundle(entrypoint: &str) {
     // Rerun build script if source directory changes
     println!("cargo::rerun-if-changed={}", source_dir.to_string_lossy());
 
+    log(&format!("Bundling {entrypoint_str} using esbuild..."));
+
     // Bundle assets using esbuild
     let esbuild = get_esbuild_path();
     let Ok(result) = Command::new(esbuild)
