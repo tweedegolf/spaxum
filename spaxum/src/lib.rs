@@ -105,6 +105,11 @@ impl Spaxum {
                 "--serve=127.0.0.1:8888",
                 "--entry-names=index",
                 "--color=false",
+                "--loader:.png=file",
+                "--loader:.jpg=file",
+                "--loader:.jpeg=file",
+                "--loader:.svg=file",
+                "--loader:.gif=file",
             ])
             .spawn()
         else {
