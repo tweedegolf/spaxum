@@ -356,6 +356,7 @@ pub fn bundle(entrypoint: &str) {
             &format!("--outfile={dist_dir_str}/index.js"),
             &format!("--metafile={manifest_file_str}"),
             "--entry-names=[name]-[hash]",
+            "--asset-names=[name]",
             "--loader:.png=file",
             "--loader:.jpg=file",
             "--loader:.jpeg=file",
