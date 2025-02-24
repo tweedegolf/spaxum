@@ -104,6 +104,8 @@ impl Spaxum {
                 &servedir,
                 "--serve=127.0.0.1:8888",
                 "--entry-names=index",
+                "--asset-names=[name]",
+                "--public-path=/static/",
                 "--color=false",
                 "--loader:.png=file",
                 "--loader:.jpg=file",
