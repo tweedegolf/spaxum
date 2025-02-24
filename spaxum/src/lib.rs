@@ -100,7 +100,7 @@ impl Spaxum {
                 entrypoint,
                 "--bundle",
                 &outdir,
-                "--watch",
+                "--watch=forever",
                 &servedir,
                 "--serve=127.0.0.1:8888",
                 "--entry-names=index",
