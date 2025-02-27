@@ -9,7 +9,11 @@ use hyper_util::{client::legacy::connect::HttpConnector, rt::TokioExecutor};
 use memory_serve::{Asset, MemoryServe};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap, env, io::{BufRead, BufReader}, path::{Path, PathBuf}, process::{exit, Command, Stdio}
+    collections::HashMap,
+    env,
+    io::{BufRead, BufReader},
+    path::{Path, PathBuf},
+    process::{exit, Command, Stdio},
 };
 
 pub use memory_serve;
@@ -37,7 +41,19 @@ enum SpaxumEngine {
 pub struct Spaxum {
     title: String,
     engine: SpaxumEngine,
+    process_index: Option<Box<dyn Fn(String) -> String>>,
 }
+
+const ESBUILD_OPTIONS: &[&str] = &[
+    "--color=false",
+    "--asset-names=[name]",
+    "--public-path=/static/",
+    "--loader:.png=file",
+    "--loader:.jpg=file",
+    "--loader:.jpeg=file",
+    "--loader:.svg=file",
+    "--loader:.gif=file",
+];
 
 /// Load the assets from the memory or proxy to an esbuild instance
 /// Returns a Spaxum instance that can be used to create an axum router
@@ -77,6 +93,7 @@ impl Spaxum {
         Self {
             title: title.to_string(),
             engine: SpaxumEngine::MemoryServe(entry_files, memory_serve),
+            process_index: None,
         }
     }
 
@@ -92,40 +109,62 @@ impl Spaxum {
             panic!("Invalid path provided by OUT_DIR");
         };
 
-        let outdir = format!("--outdir={dist_dir}");
-        let servedir = format!("--servedir={dist_dir}");
-
         let Ok(mut child) = Command::new(esbuild)
             .args([
                 entrypoint,
                 "--bundle",
-                &outdir,
+                &format!("--outdir={dist_dir}"),
                 "--watch=forever",
-                &servedir,
+                &format!("--servedir={dist_dir}"),
                 "--serve=127.0.0.1:8888",
                 "--entry-names=index",
-                "--asset-names=[name]",
-                "--public-path=/static/",
-                "--color=false",
-                "--loader:.png=file",
-                "--loader:.jpg=file",
-                "--loader:.jpeg=file",
-                "--loader:.svg=file",
-                "--loader:.gif=file",
             ])
+            .args(ESBUILD_OPTIONS)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
         else {
             panic!("esbuild failed to start");
         };
 
         tokio::task::spawn_blocking(move || {
+            if let Some(ref mut stdout) = child.stdout {
+                for line in BufReader::new(stdout).lines() {
+                    let line = line.unwrap();
+                    println!("esbuild: {line}");
+                }
+            }
+
+            if let Some(ref mut stderr) = child.stderr {
+                for line in BufReader::new(stderr).lines() {
+                    let line = line.unwrap();
+                    println!("esbuild error: {line}");
+                }
+            }
+
             child.wait().expect("esbuild failed to start");
         });
 
         Self {
             title: title.to_string(),
             engine: SpaxumEngine::Proxy,
+            process_index: None,
         }
+    }
+
+    /// Set the HTML page title
+    pub fn set_title(mut self, title: impl Into<String>) -> Self {
+        self.title = title.into();
+
+        self
+    }
+
+    /// Set the process index function, this function is called before serving the index.html
+    /// This can be used to process the index.html before serving it
+    pub fn set_process_html(mut self, process_index: impl Fn(String) -> String + 'static) -> Self {
+        self.process_index = Some(Box::new(process_index));
+
+        self
     }
 
     /// Get the memory serve instance, this can de uysed tio fine-tune memory serve settings
@@ -138,22 +177,31 @@ impl Spaxum {
 
     /// Get the axum router for the Spaxum instance, serves statis assets (from the "/static" path)
     pub fn router<S>(self) -> Router<S>
-    where S: Clone + Send + Sync + 'static
+    where
+        S: Clone + Send + Sync + 'static,
     {
         match self.engine {
             SpaxumEngine::MemoryServe(entry_files, memory_serve) => {
-                let html = include_str!("../index.html")
+                let mut html = include_str!("../index.html")
                     .replace("%TITLE%", &self.title)
                     .replace("%SCRIPT%", &entry_files.js)
                     .replace("%STYLESHEET%", &entry_files.css);
+
+                if let Some(process_index) = self.process_index {
+                    html = process_index(html);
+                }
 
                 Router::new()
                     .nest("/static", memory_serve.into_router())
                     .fallback(Html(html))
             }
             _ => {
-                let html =
+                let mut html =
                     include_str!("../index_live_reload.html").replace("%TITLE%", &self.title);
+
+                if let Some(process_index) = self.process_index {
+                    html = process_index(html);
+                }
 
                 let client: Client =
                     hyper_util::client::legacy::Client::<(), ()>::builder(TokioExecutor::new())
@@ -363,16 +411,9 @@ pub fn bundle(entrypoint: &str) {
             &format!("--outfile={dist_dir_str}/index.js"),
             &format!("--metafile={manifest_file_str}"),
             "--entry-names=[name]-[hash]",
-            "--asset-names=[name]",
-            "--loader:.png=file",
-            "--loader:.jpg=file",
-            "--loader:.jpeg=file",
-            "--loader:.svg=file",
-            "--loader:.gif=file",
-            "--public-path=/static/",
             "--minify",
-            "--color=false",
         ])
+        .args(ESBUILD_OPTIONS)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -383,14 +424,14 @@ pub fn bundle(entrypoint: &str) {
     if let Some(ref mut stdout) = child.stdout {
         for line in BufReader::new(stdout).lines() {
             let line = line.unwrap();
-            log(&format!("esbuild error: {line}"));
+            log(&format!("esbuild: {line}"));
         }
     }
 
     if let Some(ref mut stderr) = child.stderr {
         for line in BufReader::new(stderr).lines() {
             let line = line.unwrap();
-            log(&format!("esbuild: {line}"));
+            log(&format!("esbuild error: {line}"));
         }
     }
 

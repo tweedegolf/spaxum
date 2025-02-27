@@ -2,7 +2,9 @@ use axum::{response::Html, routing::get, Router};
 
 #[tokio::main]
 async fn main() {
-    let frontend = spaxum::load!("Example Site");
+    let frontend = spaxum::load!("Example")
+        .set_title("Example Site")
+        .set_process_html(|html: String| html.replace("Example Site", "Example Page"));
 
     let app = Router::new()
         .merge(frontend.router())
