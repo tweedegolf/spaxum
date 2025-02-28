@@ -41,6 +41,7 @@ enum SpaxumEngine {
 pub struct Spaxum {
     title: String,
     engine: SpaxumEngine,
+    html_template: Option<String>,
     process_index: Option<Box<dyn Fn(String) -> String>>,
 }
 
@@ -94,6 +95,7 @@ impl Spaxum {
             title: title.to_string(),
             engine: SpaxumEngine::MemoryServe(entry_files, memory_serve),
             process_index: None,
+            html_template: None,
         }
     }
 
@@ -149,6 +151,7 @@ impl Spaxum {
             title: title.to_string(),
             engine: SpaxumEngine::Proxy,
             process_index: None,
+            html_template: None,
         }
     }
 
@@ -167,6 +170,13 @@ impl Spaxum {
         self
     }
 
+    /// Set the HTML template, this template is used to render the index.html
+    pub fn set_html_template(mut self, html_template: impl Into<String>) -> Self {
+        self.html_template = Some(html_template.into());
+
+        self
+    }
+
     /// Get the memory serve instance, this can de uysed tio fine-tune memory serve settings
     pub fn memory_serve(&self) -> Option<&MemoryServe> {
         match &self.engine {
@@ -180,12 +190,19 @@ impl Spaxum {
     where
         S: Clone + Send + Sync + 'static,
     {
+        let mut html = match self.html_template {
+            Some(html) => html,
+            None => include_str!("../index.html").to_string(),
+        };
+
+        html = html.replace("%TITLE%", &self.title);
+
         match self.engine {
             SpaxumEngine::MemoryServe(entry_files, memory_serve) => {
-                let mut html = include_str!("../index.html")
-                    .replace("%TITLE%", &self.title)
+                html = html
                     .replace("%SCRIPT%", &entry_files.js)
                     .replace("%STYLESHEET%", &entry_files.css);
+
 
                 if let Some(process_index) = self.process_index {
                     html = process_index(html);
@@ -196,8 +213,12 @@ impl Spaxum {
                     .fallback(Html(html))
             }
             _ => {
-                let mut html =
-                    include_str!("../index_live_reload.html").replace("%TITLE%", &self.title);
+                let live_reload = include_str!("../live_reload.html");
+
+                html = html
+                    .replace("%SCRIPT%", "index.js")
+                    .replace("%STYLESHEET%", "index.css")
+                    .replace("</body>", &format!("{live_reload}</body>"));
 
                 if let Some(process_index) = self.process_index {
                     html = process_index(html);
