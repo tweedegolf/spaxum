@@ -31,9 +31,15 @@ pub struct EntryFiles {
     pub css: String,
 }
 
+/// Entrypoint for the esbuild instance
+type EntryPoint = String;
+
+/// Directory to serve the assets from
+type DistDir = String;
+
 /// Engine for serving assets, either proxy to an eslint instance or serve from memory
 enum SpaxumEngine {
-    Proxy,
+    Proxy(EntryPoint, DistDir),
     MemoryServe(EntryFiles, MemoryServe),
 }
 
@@ -41,6 +47,7 @@ enum SpaxumEngine {
 pub struct Spaxum {
     title: String,
     engine: SpaxumEngine,
+    esbuild_args: Vec<String>,
     html_template: Option<String>,
     process_index: Option<Box<dyn Fn(String) -> String>>,
 }
@@ -93,6 +100,7 @@ impl Spaxum {
 
         Self {
             title: title.to_string(),
+            esbuild_args: Vec::new(),
             engine: SpaxumEngine::MemoryServe(entry_files, memory_serve),
             process_index: None,
             html_template: None,
@@ -102,8 +110,6 @@ impl Spaxum {
     /// Create a new Spaxum instance, with the page title, entrypoint and dist directory
     /// Uses esbuild to bundle the assets and serve them in development mode
     pub fn new_proxy(title: &str, entrypoint: &str, dist_dir: &Path) -> Self {
-        let esbuild = get_esbuild_path();
-
         // cleanup and ignore if directory is already empty
         let _ = std::fs::remove_dir_all(dist_dir);
 
@@ -111,17 +117,35 @@ impl Spaxum {
             panic!("Invalid path provided by OUT_DIR");
         };
 
+        Self {
+            title: title.to_string(),
+            esbuild_args: Vec::new(),
+            engine: SpaxumEngine::Proxy(entrypoint.into(), dist_dir.into()),
+            process_index: None,
+            html_template: None,
+        }
+    }
+
+    pub fn start_proxy(&self) {
+        let (entrypoint, dist_dir) = match &self.engine {
+            SpaxumEngine::Proxy(entrypoint, dist_dir) => (entrypoint, dist_dir),
+            _ => panic!("Invalid engine type"),
+        };
+
+        let esbuild = get_esbuild_path();
+
         let Ok(mut child) = Command::new(esbuild)
             .args([
-                entrypoint,
+                &entrypoint,
                 "--bundle",
-                &format!("--outdir={dist_dir}"),
+                format!("--outdir={dist_dir}").as_str(),
                 "--watch=forever",
-                &format!("--servedir={dist_dir}"),
+                format!("--servedir={dist_dir}").as_str(),
                 "--serve=127.0.0.1:8888",
                 "--entry-names=index",
             ])
             .args(ESBUILD_OPTIONS)
+            .args(&self.esbuild_args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -146,13 +170,6 @@ impl Spaxum {
 
             child.wait().expect("esbuild failed to start");
         });
-
-        Self {
-            title: title.to_string(),
-            engine: SpaxumEngine::Proxy,
-            process_index: None,
-            html_template: None,
-        }
     }
 
     /// Set the HTML page title
@@ -177,6 +194,13 @@ impl Spaxum {
         self
     }
 
+    /// Set additional esbuild arguments, these arguments are passed to the esbuild instance
+    pub fn set_esbuild_args(mut self, args: Vec<String>) -> Self {
+        self.esbuild_args = args;
+
+        self
+    }
+
     /// Get the memory serve instance, this can de uysed tio fine-tune memory serve settings
     pub fn memory_serve(&self) -> Option<&MemoryServe> {
         match &self.engine {
@@ -190,19 +214,18 @@ impl Spaxum {
     where
         S: Clone + Send + Sync + 'static,
     {
-        let mut html = match self.html_template {
-            Some(html) => html,
-            None => include_str!("../index.html").to_string(),
+        let html = match self.html_template {
+            Some(ref html) => html,
+            None => include_str!("../index.html"),
         };
 
-        html = html.replace("%TITLE%", &self.title);
+        let mut html = html.replace("%TITLE%", &self.title);
 
         match self.engine {
             SpaxumEngine::MemoryServe(entry_files, memory_serve) => {
                 html = html
                     .replace("%SCRIPT%", &entry_files.js)
                     .replace("%STYLESHEET%", &entry_files.css);
-
 
                 if let Some(process_index) = self.process_index {
                     html = process_index(html);
@@ -213,6 +236,8 @@ impl Spaxum {
                     .fallback(Html(html))
             }
             _ => {
+                self.start_proxy();
+
                 let live_reload = include_str!("../live_reload.html");
 
                 html = html
