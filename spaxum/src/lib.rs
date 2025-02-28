@@ -399,13 +399,13 @@ fn write_asset_file(out_dir: &Path, code: &str) {
 /// Bundle the assets using release compilation with esbuild
 /// Pass the entrypoint to the runtime for debug builds
 pub fn bundle(entrypoint: &str) {
-    bundle_with_args(entrypoint, Vec::new());
+    bundle_with_args(entrypoint, &[]);
 }
 
 /// Bundle the assets using release compilation with esbuild
 /// Pass the entrypoint to the runtime for debug builds
 /// Optionally pass additional arguments to esbuild
-pub fn bundle_with_args(entrypoint: &str, build_args: Vec<String>) {
+pub fn bundle_with_args(entrypoint: &str, build_args: &[&str]) {
     // Log messages to cargo
     fn log(msg: &str) {
         if std::env::var("SPAXUM_QUIET") != Ok("1".to_string()) {
@@ -467,7 +467,7 @@ pub fn bundle_with_args(entrypoint: &str, build_args: Vec<String>) {
             "--minify",
         ])
         .args(ESBUILD_OPTIONS)
-        .args(&build_args)
+        .args(build_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
