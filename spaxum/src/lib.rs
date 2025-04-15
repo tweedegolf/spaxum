@@ -1,8 +1,8 @@
 use axum::{
+    Router,
     extract::{Request, State},
     response::{Html, Response},
     routing::get,
-    Router,
 };
 use hyper::{StatusCode, Uri};
 use hyper_util::{client::legacy::connect::HttpConnector, rt::TokioExecutor};
@@ -13,7 +13,7 @@ use std::{
     env,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
-    process::{exit, Command, Stdio},
+    process::{Command, Stdio, exit},
 };
 
 pub use memory_serve;
@@ -136,7 +136,7 @@ impl Spaxum {
 
         let Ok(mut child) = Command::new(esbuild)
             .args([
-                &entrypoint,
+                entrypoint,
                 "--bundle",
                 format!("--outdir={dist_dir}").as_str(),
                 "--watch=forever",
@@ -474,8 +474,6 @@ pub fn bundle_with_args(entrypoint: &str, build_args: &[&str]) {
     else {
         error!("esbuild failed to start");
     };
-
-
 
     if let Some(ref mut stdout) = child.stdout {
         for line in BufReader::new(stdout).lines() {
