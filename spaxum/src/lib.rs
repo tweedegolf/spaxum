@@ -8,12 +8,13 @@ use hyper::{StatusCode, Uri};
 use hyper_util::{client::legacy::connect::HttpConnector, rt::TokioExecutor};
 use memory_serve::{Asset, MemoryServe};
 use serde::{Deserialize, Serialize};
+use tokio::{io::AsyncBufReadExt, process::Command};
 use std::{
     collections::HashMap,
     env,
-    io::{BufRead, BufReader},
+    io::{BufRead},
     path::{Path, PathBuf},
-    process::{Command, Stdio, exit},
+    process::{Stdio, exit},
 };
 
 pub use memory_serve;
@@ -146,6 +147,7 @@ impl Spaxum {
             ])
             .args(ESBUILD_OPTIONS)
             .args(&self.esbuild_args)
+            .kill_on_drop(true)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -153,22 +155,49 @@ impl Spaxum {
             panic!("esbuild failed to start");
         };
 
-        tokio::task::spawn_blocking(move || {
-            if let Some(ref mut stdout) = child.stdout {
-                for line in BufReader::new(stdout).lines() {
-                    let line = line.unwrap();
-                    println!("esbuild: {line}");
+        tokio::spawn( async move {
+            let stdout = child.stdout.take().expect("esbuild did not have a handle to stdout");
+            let mut stdout_reader = tokio::io::BufReader::new(stdout).lines();
+
+            let stderr = child.stderr.take().expect("esbuild did not have a handle to stderr");
+            let mut stderr_reader = tokio::io::BufReader::new(stderr).lines();
+
+            loop {
+                tokio::select! {
+                    next_line = stdout_reader.next_line() => {
+                        if let Ok(Some(line)) = next_line {
+                            println!("esbuild: {line}");
+                        } else {
+                            eprintln!("esbuild: stdout closed");
+                            break;
+                        }
+                    },
+                    next_error_line = stderr_reader.next_line() => {
+                        if let Ok(Some(line)) = next_error_line {
+                            eprintln!("esbuild: {line}");
+                        } else {
+                            eprintln!("esbuild: stderr closed");
+                            break;
+                        }
+                    },
+                    process_result = child.wait() => {
+                        match process_result {
+                            Ok(exit_status) => {
+                                if exit_status.success() {
+                                    println!("esbuild process exited successfully");
+                                } else {
+                                    eprintln!("esbuild process exited with error");
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("esbuild process failed to exit: {e}");
+                                break;
+                            }
+                        }
+                    }
                 }
             }
-
-            if let Some(ref mut stderr) = child.stderr {
-                for line in BufReader::new(stderr).lines() {
-                    let line = line.unwrap();
-                    println!("esbuild error: {line}");
-                }
-            }
-
-            child.wait().expect("esbuild failed to start");
         });
     }
 
@@ -201,7 +230,7 @@ impl Spaxum {
         self
     }
 
-    /// Get the memory serve instance, this can de uysed tio fine-tune memory serve settings
+    /// Get the memory serve instance, this can de used to fine-tune memory serve settings
     pub fn memory_serve(&self) -> Option<&MemoryServe> {
         match &self.engine {
             SpaxumEngine::MemoryServe(_, memory_serve) => Some(memory_serve),
@@ -209,7 +238,7 @@ impl Spaxum {
         }
     }
 
-    /// Get the axum router for the Spaxum instance, serves statis assets (from the "/static" path)
+    /// Get the axum router for the Spaxum instance, serves static assets (from the "/static" path)
     pub fn router<S>(self) -> Router<S>
     where
         S: Clone + Send + Sync + 'static,
@@ -457,7 +486,7 @@ pub fn bundle_with_args(entrypoint: &str, build_args: &[&str]) {
 
     // Bundle assets using esbuild
     let esbuild = get_esbuild_path();
-    let Ok(mut child) = Command::new(esbuild)
+    let Ok(mut child) = std::process::Command::new(esbuild)
         .args([
             "--bundle",
             &entrypoint_str,
@@ -476,14 +505,14 @@ pub fn bundle_with_args(entrypoint: &str, build_args: &[&str]) {
     };
 
     if let Some(ref mut stdout) = child.stdout {
-        for line in BufReader::new(stdout).lines() {
+        for line in std::io::BufReader::new(stdout).lines() {
             let line = line.unwrap();
             log(&format!("esbuild: {line}"));
         }
     }
 
     if let Some(ref mut stderr) = child.stderr {
-        for line in BufReader::new(stderr).lines() {
+        for line in std::io::BufReader::new(stderr).lines() {
             let line = line.unwrap();
             log(&format!("esbuild error: {line}"));
         }
