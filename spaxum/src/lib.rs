@@ -4,10 +4,12 @@ use axum::{
     response::{Html, Response},
     routing::get,
 };
+use base64::Engine;
 use hyper::{StatusCode, Uri};
 use hyper_util::{client::legacy::connect::HttpConnector, rt::TokioExecutor};
 use memory_serve::{Asset, MemoryServe};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::{io::AsyncBufReadExt, process::Command};
 use std::{
     collections::HashMap,
@@ -30,6 +32,8 @@ type Client = hyper_util::client::legacy::Client<
 pub struct EntryFiles {
     pub js: String,
     pub css: String,
+    pub js_hash: String,
+    pub css_hash: String,
 }
 
 /// Entrypoint for the esbuild instance
@@ -86,11 +90,27 @@ macro_rules! load {
                 css: option_env!("SPAXUM_CSS_ENTRY")
                     .unwrap_or_default()
                     .to_string(),
+                js_hash: option_env!("SPAXUM_JS_HASH")
+                    .unwrap_or_default()
+                    .to_string(),
+                css_hash: option_env!("SPAXUM_CSS_HASH")
+                    .unwrap_or_default()
+                    .to_string(),
             };
 
             spaxum::Spaxum::new($title, assets, entry_files)
         }
     }};
+}
+
+/// Apply integrity attributes to the HTML template, if the hash is empty, remove the integrity attribute
+fn apply_integrity(html: String, placeholder: &str, hash: &str) -> String {
+    if hash.is_empty() {
+        let attr = format!(" integrity=\"{placeholder}\"");
+        html.replace(&attr, "")
+    } else {
+        html.replace(placeholder, hash)
+    }
 }
 
 impl Spaxum {
@@ -238,6 +258,27 @@ impl Spaxum {
         }
     }
 
+    /// Get the CSP directive snippet containing script/style hashes.
+    /// Returns an empty string when hashes are unavailable (e.g. dev proxy).
+    pub fn csp_hashes(&self) -> String {
+        let (js_hash, css_hash) = match &self.engine {
+            SpaxumEngine::MemoryServe(entry_files, _) => {
+                (entry_files.js_hash.as_str(), entry_files.css_hash.as_str())
+            }
+            _ => ("", ""),
+        };
+
+        let mut parts = Vec::new();
+        if !js_hash.is_empty() {
+            parts.push(format!("script-src '{js_hash}'"));
+        }
+        if !css_hash.is_empty() {
+            parts.push(format!("style-src '{css_hash}'"));
+        }
+
+        parts.join("; ")
+    }
+
     /// Get the axum router for the Spaxum instance, serves static assets (from the "/static" path)
     pub fn router<S>(self) -> Router<S>
     where
@@ -255,6 +296,8 @@ impl Spaxum {
                 html = html
                     .replace("%SCRIPT%", &entry_files.js)
                     .replace("%STYLESHEET%", &entry_files.css);
+                html = apply_integrity(html, "%SCRIPT_HASH%", &entry_files.js_hash);
+                html = apply_integrity(html, "%STYLESHEET_HASH%", &entry_files.css_hash);
 
                 if let Some(process_index) = self.process_index {
                     html = process_index(html);
@@ -273,6 +316,8 @@ impl Spaxum {
                     .replace("%SCRIPT%", "index.js")
                     .replace("%STYLESHEET%", "index.css")
                     .replace("</body>", &format!("{live_reload}</body>"));
+                html = apply_integrity(html, "%SCRIPT_HASH%", "");
+                html = apply_integrity(html, "%STYLESHEET_HASH%", "");
 
                 if let Some(process_index) = self.process_index {
                     html = process_index(html);
@@ -363,6 +408,8 @@ impl EntryFiles {
                                 Some(Path::new(&f).file_name()?.to_string_lossy().to_string())
                             })
                             .unwrap_or_default(),
+                        js_hash: String::new(),
+                        css_hash: String::new(),
                     });
                 }
             }
@@ -383,6 +430,27 @@ macro_rules! error {
         println!("cargo::error={}", format!($s, $($v)*));
         exit(1);
     };
+}
+
+fn compute_sri_hash(path: &Path) -> String {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            error!(
+                "Unable to read asset for hash: {} {e:?}",
+                path.to_string_lossy()
+            );
+        }
+    };
+
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let hash = hasher.finalize();
+
+    format!(
+        "sha256-{}",
+        base64::engine::general_purpose::STANDARD.encode(hash)
+    )
 }
 
 /// Get the path to the esbuild executable
@@ -531,20 +599,29 @@ pub fn bundle_with_args(entrypoint: &str, build_args: &[&str]) {
     log("esbuild completed successfully");
 
     // read contents of manifest_file as string
-    let Some(entry_point) = EntryFiles::from_manifest(&manifest_file_str, &entrypoint) else {
+    let Some(mut entry_point) = EntryFiles::from_manifest(&manifest_file_str, &entrypoint) else {
         error!(
             "Unable to find entrypoint in manifest file: {}",
             manifest_file_str
         );
     };
 
+    entry_point.js_hash = compute_sri_hash(&dist_dir.join(&entry_point.js));
+    entry_point.css_hash = if entry_point.css.is_empty() {
+        String::new()
+    } else {
+        compute_sri_hash(&dist_dir.join(&entry_point.css))
+    };
+
     // Set environment variables for the entrypoint files
     println!("cargo::rustc-env=SPAXUM_JS_ENTRY={}", entry_point.js);
     println!("cargo::rustc-env=SPAXUM_CSS_ENTRY={}", entry_point.css);
+    println!("cargo::rustc-env=SPAXUM_JS_HASH={}", entry_point.js_hash);
+    println!("cargo::rustc-env=SPAXUM_CSS_HASH={}", entry_point.css_hash);
 
     // Convert assets to code and write to file
     let code =
-        memory_serve_core::assets_to_code(&dist_dir_str, &dist_dir, Some(out_dir), true, log);
+        memory_serve::assets_to_code(&dist_dir_str, &dist_dir, out_dir, true, log);
 
     write_asset_file(out_dir, &code);
 }
