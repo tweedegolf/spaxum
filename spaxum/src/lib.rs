@@ -1,6 +1,7 @@
 use axum::{
     Router,
     extract::{Request, State},
+    http::{HeaderValue, header::HOST},
     response::{Html, Response},
     routing::get,
 };
@@ -63,6 +64,8 @@ const ESBUILD_OPTIONS: &[&str] = &[
     "--loader:.svg=file",
     "--loader:.gif=file",
 ];
+
+const ESBUILD_DEV_SERVER: &str = "127.0.0.1:8888";
 
 /// Load the assets from the memory or proxy to an esbuild instance
 /// Returns a Spaxum instance that can be used to create an axum router
@@ -142,7 +145,7 @@ impl Spaxum {
                 format!("--outdir={dist_dir}").as_str(),
                 "--watch=forever",
                 format!("--servedir={dist_dir}").as_str(),
-                "--serve=127.0.0.1:8888",
+                format!("--serve={ESBUILD_DEV_SERVER}").as_str(),
                 "--entry-names=index",
             ])
             .args(ESBUILD_OPTIONS)
@@ -314,13 +317,16 @@ async fn proxy_handler(
         .map(|v| v.as_str())
         .unwrap_or(path);
 
-    let uri = format!("http://127.0.0.1:8888{}", path_query);
+    let uri = format!("http://{ESBUILD_DEV_SERVER}{path_query}");
 
     let Ok(uri) = Uri::try_from(uri) else {
         return Err(StatusCode::BAD_REQUEST);
     };
 
     *req.uri_mut() = uri;
+    // esbuild validates the Host header, so rewrite it for the internal proxy hop.
+    req.headers_mut()
+        .insert(HOST, HeaderValue::from_static(ESBUILD_DEV_SERVER));
 
     Ok(client
         .request(req)
