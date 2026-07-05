@@ -196,8 +196,10 @@ impl Spaxum {
                                     println!("esbuild process exited successfully");
                                 } else {
                                     eprintln!("esbuild process exited with error");
-                                    break;
                                 }
+                                // The child has been reaped; stop selecting on it so the
+                                // loop doesn't spin on the now-immediately-ready wait().
+                                break;
                             }
                             Err(e) => {
                                 eprintln!("esbuild process failed to exit: {e}");
@@ -257,13 +259,13 @@ impl Spaxum {
             None => include_str!("../index.html"),
         };
 
-        let mut html = html.replace("%TITLE%", &self.title);
+        let mut html = html.replace("%TITLE%", &escape_html(&self.title));
 
         match self.engine {
             SpaxumEngine::MemoryServe(entry_files, memory_serve) => {
                 html = html
-                    .replace("%SCRIPT%", &entry_files.js)
-                    .replace("%STYLESHEET%", &entry_files.css);
+                    .replace("%SCRIPT%", &script_tag(&entry_files.js))
+                    .replace("%STYLESHEET%", &style_tag(&entry_files.css));
 
                 if let Some(process_index) = self.process_index {
                     html = process_index(html);
@@ -279,16 +281,23 @@ impl Spaxum {
                 let live_reload = include_str!("../live_reload.html");
 
                 html = html
-                    .replace("%SCRIPT%", "index.js")
-                    .replace("%STYLESHEET%", "index.css")
-                    .replace("</body>", &format!("{live_reload}</body>"));
+                    .replace("%SCRIPT%", &script_tag("index.js"))
+                    .replace("%STYLESHEET%", &style_tag("index.css"));
+
+                // Inject the live-reload script before </body>, falling back to
+                // appending it if the (possibly custom) template has no closing tag.
+                html = if html.contains("</body>") {
+                    html.replace("</body>", &format!("{live_reload}</body>"))
+                } else {
+                    format!("{html}{live_reload}")
+                };
 
                 if let Some(process_index) = self.process_index {
                     html = process_index(html);
                 }
 
                 let client: Client =
-                    hyper_util::client::legacy::Client::<(), ()>::builder(TokioExecutor::new())
+                    hyper_util::client::legacy::Client::builder(TokioExecutor::new())
                         .build(HttpConnector::new());
 
                 let proxy_router = Router::new()
@@ -300,6 +309,33 @@ impl Spaxum {
                     .fallback(Html(html))
             }
         }
+    }
+}
+
+/// Escape a string for safe interpolation into HTML text/attribute context
+fn escape_html(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Build the `<script>` tag for the given entry file, or nothing if there is none
+fn script_tag(js: &str) -> String {
+    if js.is_empty() {
+        String::new()
+    } else {
+        format!("<script src=\"/static/{js}\"></script>")
+    }
+}
+
+/// Build the `<link>` stylesheet tag for the given entry file, or nothing if there is none
+fn style_tag(css: &str) -> String {
+    if css.is_empty() {
+        String::new()
+    } else {
+        format!("<link rel=\"stylesheet\" href=\"/static/{css}\">")
     }
 }
 
@@ -328,10 +364,12 @@ async fn proxy_handler(
     req.headers_mut()
         .insert(HOST, HeaderValue::from_static(ESBUILD_DEV_SERVER));
 
+    // A failure here means the upstream esbuild dev server is unreachable, not
+    // that the client's request was malformed, so surface it as a 502.
     Ok(client
         .request(req)
         .await
-        .map_err(|_| StatusCode::BAD_REQUEST)?
+        .map_err(|_| StatusCode::BAD_GATEWAY)?
         .into_response())
 }
 
@@ -356,8 +394,13 @@ impl EntryFiles {
         let manifest_str =
             std::fs::read_to_string(manifest_file).expect("Unable to read manifest file.");
 
+        Self::from_manifest_str(&manifest_str, entrypoint)
+    }
+
+    /// Get the entry files from the (already read) esbuild manifest contents
+    fn from_manifest_str(manifest_str: &str, entrypoint: &Path) -> Option<Self> {
         let manifest: Manifest =
-            serde_json::from_str(&manifest_str).expect("Unmable to parse manifest file.");
+            serde_json::from_str(manifest_str).expect("Unable to parse manifest file.");
 
         for (name, output) in manifest.outputs.iter() {
             if let Some(js) = output.entry_point.as_ref()
@@ -387,7 +430,9 @@ impl EntryFiles {
 /// Error macro for build scripts
 macro_rules! error {
     ($s:expr) => {
-        println!("cargo::error={}", $s);
+        // format! so inline captures like {entrypoint_str} are interpolated
+        // rather than printed literally.
+        println!("cargo::error={}", format!($s));
         exit(1);
     };
 
@@ -404,19 +449,15 @@ fn get_esbuild_path() -> PathBuf {
         return PathBuf::from("esbuild");
     }
 
-    let current_dir = Path::new(file!()).parent().and_then(|p| p.parent());
+    // CARGO_MANIFEST_DIR is the absolute path to this crate's root at compile
+    // time, which is where the precompiled esbuild binary is shipped. This is
+    // more reliable than file!(), which may be relative to the build-time CWD.
+    let esbuild = Path::new(env!("CARGO_MANIFEST_DIR")).join("esbuild");
 
-    match current_dir {
-        Some(p) => {
-            let esbuild = p.join("esbuild");
-
-            if esbuild.exists() {
-                esbuild
-            } else {
-                PathBuf::from("esbuild")
-            }
-        }
-        None => PathBuf::from("esbuild"),
+    if esbuild.exists() {
+        esbuild
+    } else {
+        PathBuf::from("esbuild")
     }
 }
 
@@ -558,4 +599,89 @@ pub fn bundle_with_args(entrypoint: &str, build_args: &[&str]) {
     let code = memory_serve::assets_to_code(&dist_dir_str, &dist_dir, out_dir, true, log);
 
     write_asset_file(out_dir, &code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escapes_html_special_characters() {
+        assert_eq!(
+            escape_html(r#"<b> & "quote""#),
+            "&lt;b&gt; &amp; &quot;quote&quot;"
+        );
+        assert_eq!(escape_html("plain title"), "plain title");
+    }
+
+    #[test]
+    fn builds_asset_tags() {
+        assert_eq!(
+            script_tag("app-ABC123.js"),
+            "<script src=\"/static/app-ABC123.js\"></script>"
+        );
+        assert_eq!(
+            style_tag("app-ABC123.css"),
+            "<link rel=\"stylesheet\" href=\"/static/app-ABC123.css\">"
+        );
+    }
+
+    #[test]
+    fn empty_entry_produces_no_tag() {
+        assert_eq!(script_tag(""), "");
+        assert_eq!(style_tag(""), "");
+    }
+
+    #[test]
+    fn parses_entry_files_from_manifest() {
+        let manifest = r#"{
+            "outputs": {
+                "dist/app-ABC123.js": {
+                    "bytes": 100,
+                    "entryPoint": "frontend/src/app.tsx",
+                    "cssBundle": "dist/app-DEF456.css"
+                },
+                "dist/app-DEF456.css": { "bytes": 50 }
+            }
+        }"#;
+
+        let entrypoint = Path::new("/project/frontend/src/app.tsx");
+        let entry = EntryFiles::from_manifest_str(manifest, entrypoint).expect("entry found");
+
+        assert_eq!(entry.js, "app-ABC123.js");
+        assert_eq!(entry.css, "app-DEF456.css");
+    }
+
+    #[test]
+    fn manifest_without_css_yields_empty_css() {
+        let manifest = r#"{
+            "outputs": {
+                "dist/app-ABC123.js": {
+                    "bytes": 100,
+                    "entryPoint": "frontend/src/app.tsx"
+                }
+            }
+        }"#;
+
+        let entrypoint = Path::new("/project/frontend/src/app.tsx");
+        let entry = EntryFiles::from_manifest_str(manifest, entrypoint).expect("entry found");
+
+        assert_eq!(entry.js, "app-ABC123.js");
+        assert_eq!(entry.css, "");
+    }
+
+    #[test]
+    fn manifest_without_matching_entrypoint_returns_none() {
+        let manifest = r#"{
+            "outputs": {
+                "dist/app-ABC123.js": {
+                    "bytes": 100,
+                    "entryPoint": "frontend/src/other.tsx"
+                }
+            }
+        }"#;
+
+        let entrypoint = Path::new("/project/frontend/src/app.tsx");
+        assert!(EntryFiles::from_manifest_str(manifest, entrypoint).is_none());
+    }
 }

@@ -1,8 +1,8 @@
 # Spaxum
 
-Bundle and serve your SPA (Spingle Page Application) using [Axum](https://github.com/tokio-rs/axum), a Rust a web application framework that focuses on ergonomics and modularity.
+Bundle and serve your SPA (Single Page Application) using [Axum](https://github.com/tokio-rs/axum), a Rust web application framework that focuses on ergonomics and modularity.
 
-Spaxum uses [esbuild](https://esbuild.github.io/) to bundle and serve frontend assets during develoopment or to bundle and minify in production.
+Spaxum uses [esbuild](https://esbuild.github.io/) to bundle and serve frontend assets during development or to bundle and minify in production.
 In release builds [memory serve](https://github.com/tweedegolf/memory-serve) embeds all assets in the binary and serves them from memory at runtime.
 
 ## Usage
@@ -44,16 +44,16 @@ async fn handler() -> Html<&'static str> {
 }
 ```
 
-Note that spaxum will will a `index.html` file that loads the bundled javascript file(s) and css stylescheets.
+Note that spaxum generates an `index.html` file that loads the bundled javascript file(s) and css stylesheets.
 
 ## Caveats
 
 Spaxum:
 
-- (an memory serve) are opinionated, they serve a specific use-case: bundle and serve simple SPA's with your Rust backend
+- (and memory serve) are opinionated, they serve a specific use-case: bundle and serve simple SPA's with your Rust backend
 - strives for zero, or minimal, configuration
 - strives to minimize the number of dependencies needed to bundle a javascript frontend
-- uses `esbuild` and and relies on the features provided by `esbuild`
+- uses `esbuild` and relies on the features provided by `esbuild`
 - does not work well if there are many or large frontend assets (since they are all loaded in memory at runtime)
 - automatically compresses assets, both in the binary and at runtime
-- spaxum ships with a precompiled version of esbuild (x86 64) and relies on a esbuild binary in your PATH as a fallback
+- spaxum ships with a precompiled version of esbuild (x86_64) and relies on an esbuild binary in your PATH as a fallback

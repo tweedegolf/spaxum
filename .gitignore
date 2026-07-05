@@ -1,5 +1,5 @@
 /example/frontend/node_modules
-/example/frontend/yarn.lock
+/example/frontend/package-lock.json
 /example/frontend/dist
 
 target/
