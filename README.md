@@ -56,4 +56,4 @@ Spaxum:
 - uses `esbuild` and relies on the features provided by `esbuild`
 - does not work well if there are many or large frontend assets (since they are all loaded in memory at runtime)
 - automatically compresses assets, both in the binary and at runtime
-- spaxum ships with a precompiled version of esbuild (x86_64) and relies on an esbuild binary in your PATH as a fallback
+- downloads a pinned release of esbuild from the npm registry on the first build (using `curl` and `tar`), verifies its checksum and caches it in your user cache directory. Prebuilt downloads are available for Linux and macOS (x86_64 and ARM64); on other platforms, or when the download fails (e.g. offline builds), spaxum falls back to an `esbuild` binary in your PATH

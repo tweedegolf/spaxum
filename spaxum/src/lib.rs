@@ -20,6 +20,10 @@ use tokio::{io::AsyncBufReadExt, process::Command};
 
 pub use memory_serve;
 
+mod esbuild_release;
+
+use esbuild_release::{ESBUILD_CHECKSUMS, ESBUILD_VERSION};
+
 /// HTTP client to proxy request in development
 type Client = hyper_util::client::legacy::Client<
     hyper_util::client::legacy::connect::HttpConnector,
@@ -50,6 +54,7 @@ pub struct Spaxum {
     title: String,
     engine: SpaxumEngine,
     esbuild_args: Vec<String>,
+    esbuild_path: PathBuf,
     html_template: Option<String>,
     process_index: Option<Box<dyn Fn(String) -> String>>,
 }
@@ -78,7 +83,13 @@ macro_rules! load {
         if let Some(entrypoint) = option_env!("SPAXUM_ENTRYPOINT") {
             let dist_dir = Path::new(concat!(env!("OUT_DIR"), "/dist"));
 
-            spaxum::Spaxum::new_proxy($title, entrypoint, dist_dir)
+            let spaxum = spaxum::Spaxum::new_proxy($title, entrypoint, dist_dir);
+
+            // Use the esbuild binary that the build script downloaded, if any
+            match option_env!("SPAXUM_ESBUILD") {
+                Some(esbuild) => spaxum.set_esbuild_path(esbuild),
+                None => spaxum,
+            }
         } else {
             let assets: &[Asset] = include!(concat!(env!("OUT_DIR"), "/spaxum.rs"));
 
@@ -105,6 +116,7 @@ impl Spaxum {
         Self {
             title: title.to_string(),
             esbuild_args: Vec::new(),
+            esbuild_path: PathBuf::from("esbuild"),
             engine: SpaxumEngine::MemoryServe(entry_files, memory_serve),
             process_index: None,
             html_template: None,
@@ -124,6 +136,7 @@ impl Spaxum {
         Self {
             title: title.to_string(),
             esbuild_args: Vec::new(),
+            esbuild_path: PathBuf::from("esbuild"),
             engine: SpaxumEngine::Proxy(entrypoint.into(), dist_dir.into()),
             process_index: None,
             html_template: None,
@@ -136,9 +149,7 @@ impl Spaxum {
             _ => panic!("Invalid engine type"),
         };
 
-        let esbuild = get_esbuild_path();
-
-        let Ok(mut child) = Command::new(esbuild)
+        let Ok(mut child) = Command::new(&self.esbuild_path)
             .args([
                 entrypoint,
                 "--bundle",
@@ -237,6 +248,14 @@ impl Spaxum {
     /// Set additional esbuild arguments, these arguments are passed to the esbuild instance
     pub fn set_esbuild_args(mut self, args: Vec<String>) -> Self {
         self.esbuild_args = args;
+
+        self
+    }
+
+    /// Set the path to the esbuild executable used by the development server,
+    /// defaults to the binary downloaded by [`bundle`] or `esbuild` in your PATH
+    pub fn set_esbuild_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.esbuild_path = path.into();
 
         self
     }
@@ -442,22 +461,158 @@ macro_rules! error {
     };
 }
 
-/// Get the path to the esbuild executable
-/// Optionally use esbuild binary shipped with spaxum, fallback the system esbuild
-fn get_esbuild_path() -> PathBuf {
-    if !cfg!(target_arch = "x86_64") {
-        return PathBuf::from("esbuild");
+/// Name of the `@esbuild/<platform>` npm package for the host, if spaxum has a
+/// pinned checksum for it (see scripts/update-esbuild.sh)
+fn esbuild_platform() -> Option<&'static str> {
+    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        Some("linux-x64")
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        Some("linux-arm64")
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        Some("darwin-x64")
+    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        Some("darwin-arm64")
+    } else {
+        None
+    }
+}
+
+/// Directory to cache downloaded esbuild binaries in, shared between projects
+fn esbuild_cache_dir() -> Option<PathBuf> {
+    if let Some(dir) = env::var_os("XDG_CACHE_HOME").filter(|dir| !dir.is_empty()) {
+        return Some(PathBuf::from(dir).join("spaxum"));
     }
 
-    // CARGO_MANIFEST_DIR is the absolute path to this crate's root at compile
-    // time, which is where the precompiled esbuild binary is shipped. This is
-    // more reliable than file!(), which may be relative to the build-time CWD.
-    let esbuild = Path::new(env!("CARGO_MANIFEST_DIR")).join("esbuild");
+    let home = PathBuf::from(env::var_os("HOME").filter(|dir| !dir.is_empty())?);
+
+    if cfg!(target_os = "macos") {
+        Some(home.join("Library/Caches/spaxum"))
+    } else {
+        Some(home.join(".cache/spaxum"))
+    }
+}
+
+/// Hex encoded SHA-256 checksum
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write;
+
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::new(), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
+}
+
+/// Download the pinned esbuild release for the given platform from the npm
+/// registry, verify its checksum and install the binary at `target`
+fn download_esbuild(platform: &str, checksum: &str, target: &Path) -> Result<(), String> {
+    let url = format!(
+        "https://registry.npmjs.org/@esbuild/{platform}/-/{platform}-{ESBUILD_VERSION}.tgz"
+    );
+
+    let Some(cache_dir) = target.parent() else {
+        return Err("invalid cache directory".to_string());
+    };
+
+    // Download and extract in a scratch directory next to the target, so the
+    // binary can be moved in place atomically (builds may run concurrently).
+    let scratch = cache_dir.join(format!(".download-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch)
+        .map_err(|e| format!("unable to create {}: {e}", scratch.display()))?;
+
+    let result = (|| {
+        let tarball = scratch.join("esbuild.tgz");
+
+        let status = std::process::Command::new("curl")
+            .args(["--fail", "--silent", "--show-error", "--location"])
+            .args(["--proto", "=https", "--output"])
+            .arg(&tarball)
+            .arg(&url)
+            .status()
+            .map_err(|e| format!("unable to run curl: {e}"))?;
+
+        if !status.success() {
+            return Err(format!("unable to download {url}"));
+        }
+
+        let bytes = std::fs::read(&tarball).map_err(|e| format!("unable to read download: {e}"))?;
+        let actual = sha256_hex(&bytes);
+
+        if actual != checksum {
+            return Err(format!(
+                "checksum mismatch for {url}: expected {checksum}, got {actual}"
+            ));
+        }
+
+        // The npm platform package stores the executable at package/bin/esbuild
+        let status = std::process::Command::new("tar")
+            .arg("-xzf")
+            .arg(&tarball)
+            .arg("-C")
+            .arg(&scratch)
+            .arg("package/bin/esbuild")
+            .status()
+            .map_err(|e| format!("unable to run tar: {e}"))?;
+
+        if !status.success() {
+            return Err(format!("unable to extract {}", tarball.display()));
+        }
+
+        std::fs::rename(scratch.join("package/bin/esbuild"), target)
+            .map_err(|e| format!("unable to install {}: {e}", target.display()))
+    })();
+
+    let _ = std::fs::remove_dir_all(&scratch);
+
+    result
+}
+
+/// Get the path to the esbuild executable
+/// Downloads the esbuild release pinned by spaxum on first use and caches it,
+/// falls back to the system esbuild if that is not possible
+fn get_esbuild_path(log: fn(&str)) -> PathBuf {
+    let system_esbuild = PathBuf::from("esbuild");
+
+    let Some(platform) = esbuild_platform() else {
+        log("No esbuild download available for this platform, using esbuild from PATH.");
+        return system_esbuild;
+    };
+
+    let Some(checksum) = ESBUILD_CHECKSUMS
+        .iter()
+        .find(|(name, _)| *name == platform)
+        .map(|(_, checksum)| *checksum)
+    else {
+        log("No esbuild checksum for this platform, using esbuild from PATH.");
+        return system_esbuild;
+    };
+
+    let Some(cache_dir) = esbuild_cache_dir() else {
+        log("Unable to determine a cache directory, using esbuild from PATH.");
+        return system_esbuild;
+    };
+
+    let esbuild = cache_dir.join(format!("esbuild-{ESBUILD_VERSION}-{platform}"));
 
     if esbuild.exists() {
-        esbuild
-    } else {
-        PathBuf::from("esbuild")
+        return esbuild;
+    }
+
+    log(&format!(
+        "Downloading esbuild {ESBUILD_VERSION} ({platform})..."
+    ));
+
+    match download_esbuild(platform, checksum, &esbuild) {
+        Ok(()) => esbuild,
+        Err(e) => {
+            log(&format!(
+                "Unable to download esbuild ({e}), using esbuild from PATH."
+            ));
+            system_esbuild
+        }
     }
 }
 
@@ -513,9 +668,13 @@ pub fn bundle_with_args(entrypoint: &str, build_args: &[&str]) {
     let manifest_file = out_dir.join("manifest.json");
     let manifest_file_str = manifest_file.to_string_lossy();
 
+    // Download esbuild on first use, or use the cached / system binary
+    let esbuild = get_esbuild_path(log);
+
     // Skip bundling in debug mode, assets will be served by the esbuild dev server
     if cfg!(debug_assertions) {
         println!("cargo::rustc-env=SPAXUM_ENTRYPOINT={entrypoint_str}");
+        println!("cargo::rustc-env=SPAXUM_ESBUILD={}", esbuild.display());
         write_asset_file(out_dir, "&[]");
         log("Skipping bundling in debug mode, assets will be served by the esbuild dev server.");
         exit(0);
@@ -538,7 +697,6 @@ pub fn bundle_with_args(entrypoint: &str, build_args: &[&str]) {
     log(&format!("Bundling {entrypoint_str} using esbuild..."));
 
     // Bundle assets using esbuild
-    let esbuild = get_esbuild_path();
     let Ok(mut child) = std::process::Command::new(esbuild)
         .args([
             "--bundle",
@@ -612,6 +770,26 @@ mod tests {
             "&lt;b&gt; &amp; &quot;quote&quot;"
         );
         assert_eq!(escape_html("plain title"), "plain title");
+    }
+
+    #[test]
+    fn computes_sha256_hex() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn pins_a_checksum_for_every_supported_platform() {
+        for platform in ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64"] {
+            assert!(
+                ESBUILD_CHECKSUMS
+                    .iter()
+                    .any(|(name, checksum)| *name == platform && checksum.len() == 64),
+                "missing checksum for {platform}"
+            );
+        }
     }
 
     #[test]
